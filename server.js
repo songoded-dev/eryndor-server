@@ -56,7 +56,7 @@ wss.on('connection', (ws) => {
             client.send(broadcastData);
           }
         });
-      } else if (data.type === 'enemy_damage') {
+      } else if (data.type === 'enemy_damage' || data.type === 'instance_spawn') {
         const hostClient = clients.get(hostId);
         if (hostClient && hostClient.readyState === 1) {
           hostClient.send(JSON.stringify(data));
