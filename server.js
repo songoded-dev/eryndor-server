@@ -1,34 +1,43 @@
-const { WebSocketServer } = require('ws');
+const http = require("http");
+const { WebSocketServer } = require("ws");
 
-const wss = new WebSocketServer({ port: 3000 });
+const port = Number(process.env.PORT) || 3000;
 
-console.log('Eryndor Multiplayer Server running on port 3000');
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("Eryndor multiplayer server");
+});
 
-const players = new Map(); // id -> player object
-const clients = new Map(); // id -> ws
-const parties = new Map(); // partyId -> { id, members: [], leader }
+const wss = new WebSocketServer({ server });
+
+server.listen(port, () => {
+  console.log(`Eryndor Multiplayer Server running on port ${port}`);
+});
+
+const players = new Map();
+const clients = new Map();
+const parties = new Map();
 let hostId = null;
 
-wss.on('connection', (ws) => {
+wss.on("connection", (ws) => {
   const playerId = Math.random().toString(36).substring(2, 9);
   console.log(`Player connected: ${playerId}`);
 
   clients.set(playerId, ws);
   players.set(playerId, { id: playerId, lastUpdate: Date.now() });
 
-  // Initial host assignment
   if (hostId === null) {
     hostId = playerId;
-    ws.send(JSON.stringify({ type: 'host_assignment', isHost: true, yourId: playerId }));
+    ws.send(JSON.stringify({ type: "host_assignment", isHost: true, yourId: playerId }));
   } else {
-    ws.send(JSON.stringify({ type: 'host_assignment', isHost: false, yourId: playerId }));
+    ws.send(JSON.stringify({ type: "host_assignment", isHost: false, yourId: playerId }));
   }
 
-  ws.on('message', (message) => {
+  ws.on("message", (message) => {
     try {
       const data = JSON.parse(message);
-      
-      if (data.type === 'player_update') {
+
+      if (data.type === "player_update") {
         players.set(playerId, {
           ...data.player,
           id: playerId,
@@ -36,7 +45,7 @@ wss.on('connection', (ws) => {
         });
 
         const broadcastData = JSON.stringify({
-          type: 'player_update',
+          type: "player_update",
           player: players.get(playerId)
         });
 
@@ -45,9 +54,9 @@ wss.on('connection', (ws) => {
             client.send(broadcastData);
           }
         });
-      } else if (data.type === 'enemy_sync' && playerId === hostId) {
+      } else if (data.type === "enemy_sync" && playerId === hostId) {
         const broadcastData = JSON.stringify({
-          type: 'enemy_sync',
+          type: "enemy_sync",
           enemies: data.enemies
         });
 
@@ -56,14 +65,14 @@ wss.on('connection', (ws) => {
             client.send(broadcastData);
           }
         });
-      } else if (data.type === 'enemy_damage' || data.type === 'instance_spawn') {
+      } else if (data.type === "enemy_damage" || data.type === "instance_spawn") {
         const hostClient = clients.get(hostId);
         if (hostClient && hostClient.readyState === 1) {
           hostClient.send(JSON.stringify(data));
         }
-      } else if (data.type === 'chat') {
+      } else if (data.type === "chat") {
         const broadcastData = JSON.stringify({
-          type: 'chat',
+          type: "chat",
           name: data.name,
           text: data.text
         });
@@ -73,8 +82,7 @@ wss.on('connection', (ws) => {
             client.send(broadcastData);
           }
         });
-      } else if (data.type === 'party_invite') {
-        // Find target player by name
+      } else if (data.type === "party_invite") {
         let targetId = null;
         for (const [id, p] of players.entries()) {
           if (p.name === data.targetName && id !== playerId) {
@@ -87,17 +95,16 @@ wss.on('connection', (ws) => {
           const targetWs = clients.get(targetId);
           if (targetWs && targetWs.readyState === 1) {
             targetWs.send(JSON.stringify({
-              type: 'party_invite',
+              type: "party_invite",
               fromId: playerId,
               fromName: players.get(playerId).name
             }));
           }
         }
-      } else if (data.type === 'party_accept') {
+      } else if (data.type === "party_accept") {
         const senderId = data.fromId;
         let party = null;
 
-        // Check if sender is already in a party
         for (const p of parties.values()) {
           if (p.members.includes(senderId)) {
             party = p;
@@ -106,7 +113,6 @@ wss.on('connection', (ws) => {
         }
 
         if (!party) {
-          // Create new party
           const partyId = Math.random().toString(36).substring(2, 9);
           party = {
             id: partyId,
@@ -116,7 +122,6 @@ wss.on('connection', (ws) => {
           };
           parties.set(partyId, party);
         } else {
-          // Join existing party
           const limit = party.isRaid ? 30 : 10;
           if (party.members.length < limit) {
             party.members.push(playerId);
@@ -124,25 +129,25 @@ wss.on('connection', (ws) => {
         }
 
         broadcastPartyUpdate(party);
-      } else if (data.type === 'party_leave') {
+      } else if (data.type === "party_leave") {
         handlePartyLeave(playerId);
-      } else if (data.type === 'party_kick') {
+      } else if (data.type === "party_kick") {
         const party = getPlayerParty(playerId);
         if (party && party.leader === playerId) {
           handlePartyLeave(data.targetId);
         }
       }
     } catch (e) {
-      console.error('Failed to parse message', e);
+      console.error("Failed to parse message", e);
     }
   });
 
-  ws.on('close', () => {
+  ws.on("close", () => {
     console.log(`Player disconnected: ${playerId}`);
     handlePartyLeave(playerId);
     players.delete(playerId);
     clients.delete(playerId);
-    
+
     if (playerId === hostId) {
       hostId = null;
       const nextId = players.keys().next().value;
@@ -150,14 +155,14 @@ wss.on('connection', (ws) => {
         hostId = nextId;
         wss.clients.forEach((client) => {
           if (client.readyState === 1) {
-            client.send(JSON.stringify({ type: 'host_promotion', newHostId: hostId }));
+            client.send(JSON.stringify({ type: "host_promotion", newHostId: hostId }));
           }
         });
       }
     }
 
     const disconnectData = JSON.stringify({
-      type: 'disconnect',
+      type: "disconnect",
       id: playerId
     });
 
@@ -168,7 +173,7 @@ wss.on('connection', (ws) => {
     });
   });
 
-  ws.on('error', console.error);
+  ws.on("error", console.error);
 });
 
 function getPlayerParty(playerId) {
@@ -183,13 +188,12 @@ function handlePartyLeave(playerId) {
   if (!party) return;
 
   party.members = party.members.filter(id => id !== playerId);
-  
+
   if (party.members.length < 2) {
-    // Notify last member and delete party
     if (party.members.length === 1) {
       const lastWs = clients.get(party.members[0]);
       if (lastWs && lastWs.readyState === 1) {
-        lastWs.send(JSON.stringify({ type: 'party_update', party: null }));
+        lastWs.send(JSON.stringify({ type: "party_update", party: null }));
       }
     }
     parties.delete(party.id);
@@ -203,7 +207,7 @@ function handlePartyLeave(playerId) {
 
 function broadcastPartyUpdate(party) {
   const updateData = JSON.stringify({
-    type: 'party_update',
+    type: "party_update",
     party: party
   });
 
