@@ -11,8 +11,10 @@ wss.on('connection', (ws) => {
   const playerId = Math.random().toString(36).substring(2, 9);
   console.log(`Player connected: ${playerId}`);
 
+  // Register player immediately
   players.set(playerId, { id: playerId, lastUpdate: Date.now() });
 
+  // Initial host assignment
   if (hostId === null) {
     hostId = playerId;
     ws.send(JSON.stringify({ type: 'host_assignment', isHost: true, yourId: playerId }));
@@ -23,7 +25,7 @@ wss.on('connection', (ws) => {
   ws.on('message', (message) => {
     try {
       const data = JSON.parse(message);
-
+      
       if (data.type === 'player_update') {
         players.set(playerId, {
           ...data.player,
@@ -42,6 +44,7 @@ wss.on('connection', (ws) => {
           }
         });
       } else if (data.type === 'enemy_sync' && playerId === hostId) {
+        // Only host can sync enemies
         const broadcastData = JSON.stringify({
           type: 'enemy_sync',
           enemies: data.enemies
@@ -53,8 +56,11 @@ wss.on('connection', (ws) => {
           }
         });
       } else if (data.type === 'enemy_damage') {
+        // Forward damage to host
         wss.clients.forEach((client) => {
+          // Find host client
           if (hostId !== null && client !== ws && client.readyState === 1) {
+            // We don't have a direct map of id -> ws, so we broadcast but host will check
             client.send(JSON.stringify(data));
           }
         });
@@ -79,12 +85,15 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     console.log(`Player disconnected: ${playerId}`);
     players.delete(playerId);
-
+    
     if (playerId === hostId) {
       hostId = null;
+      // Assign new host
       const nextId = players.keys().next().value;
       if (nextId) {
         hostId = nextId;
+        // Need to find the ws for nextId. 
+        // Let's broadcast host change and clients will check their own ID.
         wss.clients.forEach((client) => {
           if (client.readyState === 1) {
             client.send(JSON.stringify({ type: 'host_promotion', newHostId: hostId }));
@@ -93,6 +102,7 @@ wss.on('connection', (ws) => {
       }
     }
 
+    // Notify others
     const disconnectData = JSON.stringify({
       type: 'disconnect',
       id: playerId
