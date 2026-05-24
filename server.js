@@ -70,6 +70,15 @@ wss.on("connection", (ws) => {
         if (hostClient && hostClient.readyState === 1) {
           hostClient.send(JSON.stringify(data));
         }
+      } else if (data.type === "player_damage" && playerId === hostId) {
+        const targetClient = clients.get(data.targetId);
+        if (targetClient && targetClient.readyState === 1) {
+          targetClient.send(JSON.stringify({
+            type: "player_damage",
+            targetId: data.targetId,
+            damage: data.damage
+          }));
+        }
       } else if (data.type === "chat") {
         const broadcastData = JSON.stringify({
           type: "chat",
