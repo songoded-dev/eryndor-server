@@ -1,9 +1,128 @@
 const http = require("http");
 const { WebSocketServer } = require("ws");
+const store = require("./store");
+const auth = require("./auth");
 
 const port = Number(process.env.PORT) || 3000;
 
+store.init();
+
+const NAME_RE = /^[A-Za-z0-9_ -]{3,20}$/;
+const PASSWORD_MIN = 6;
+const PASSWORD_MAX = 200;
+const MAX_BODY_BYTES = 512 * 1024; // a character save with full inventory, comfortably
+
+function sendJson(res, status, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS"
+  });
+  res.end(body);
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error("body_too_large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (!chunks.length) return resolve({});
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      } catch {
+        reject(new Error("bad_json"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+// Returns the authenticated userId from the Bearer token, or null.
+function authUserId(req) {
+  const header = req.headers["authorization"] || "";
+  const match = header.match(/^Bearer (.+)$/);
+  if (!match) return null;
+  const userId = auth.verifyToken(match[1]);
+  return userId && store.getUserById(userId) ? userId : null;
+}
+
+async function handleApi(req, res, url) {
+  if (req.method === "OPTIONS") return sendJson(res, 204, {});
+
+  if (req.method === "POST" && url.pathname === "/api/register") {
+    const body = await readJsonBody(req);
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    const password = typeof body.password === "string" ? body.password : "";
+    if (!NAME_RE.test(name)) return sendJson(res, 400, { error: "invalid_name" });
+    if (password.length < PASSWORD_MIN || password.length > PASSWORD_MAX) return sendJson(res, 400, { error: "invalid_password" });
+    if (store.getUserByName(name)) return sendJson(res, 409, { error: "name_taken" });
+    const { salt, hash } = auth.hashPassword(password);
+    const user = store.createUser({ name, salt, hash });
+    return sendJson(res, 200, { token: auth.signToken(user.id), name: user.name });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/login") {
+    const body = await readJsonBody(req);
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    const password = typeof body.password === "string" ? body.password : "";
+    const user = store.getUserByName(name);
+    // Always run a verify to keep timing similar whether or not the user exists.
+    const ok = user
+      ? auth.verifyPassword(password, user.salt, user.hash)
+      : auth.verifyPassword(password, "00000000000000000000000000000000", "00");
+    if (!user || !ok) return sendJson(res, 401, { error: "bad_credentials" });
+    return sendJson(res, 200, { token: auth.signToken(user.id), name: user.name });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/characters") {
+    const userId = authUserId(req);
+    if (!userId) return sendJson(res, 401, { error: "unauthorized" });
+    return sendJson(res, 200, { characters: store.listCharacters(userId), name: store.getUserById(userId).name });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/character") {
+    const userId = authUserId(req);
+    if (!userId) return sendJson(res, 401, { error: "unauthorized" });
+    const body = await readJsonBody(req);
+    const slot = Number(body.slot);
+    if (!Number.isInteger(slot) || slot < 0 || slot > 9) return sendJson(res, 400, { error: "invalid_slot" });
+    if (!body.data || typeof body.data !== "object") return sendJson(res, 400, { error: "invalid_data" });
+    store.saveCharacter(userId, slot, body.data);
+    return sendJson(res, 200, { ok: true });
+  }
+
+  if (req.method === "DELETE" && url.pathname === "/api/character") {
+    const userId = authUserId(req);
+    if (!userId) return sendJson(res, 401, { error: "unauthorized" });
+    const slot = Number(url.searchParams.get("slot"));
+    if (!Number.isInteger(slot) || slot < 0 || slot > 9) return sendJson(res, 400, { error: "invalid_slot" });
+    store.deleteCharacter(userId, slot);
+    return sendJson(res, 200, { ok: true });
+  }
+
+  return sendJson(res, 404, { error: "not_found" });
+}
+
 const server = http.createServer((req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  if (url.pathname.startsWith("/api/")) {
+    handleApi(req, res, url).catch((err) => {
+      const status = err.message === "body_too_large" ? 413 : err.message === "bad_json" ? 400 : 500;
+      sendJson(res, status, { error: err.message || "server_error" });
+    });
+    return;
+  }
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("Eryndor multiplayer server");
 });
