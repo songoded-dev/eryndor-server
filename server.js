@@ -5,8 +5,6 @@ const auth = require("./auth");
 
 const port = Number(process.env.PORT) || 3000;
 
-store.init();
-
 const NAME_RE = /^[A-Za-z0-9_ -]{3,20}$/;
 const PASSWORD_MIN = 6;
 const PASSWORD_MAX = 200;
@@ -66,9 +64,13 @@ async function handleApi(req, res, url) {
     const password = typeof body.password === "string" ? body.password : "";
     if (!NAME_RE.test(name)) return sendJson(res, 400, { error: "invalid_name" });
     if (password.length < PASSWORD_MIN || password.length > PASSWORD_MAX) return sendJson(res, 400, { error: "invalid_password" });
-    if (store.getUserByName(name)) return sendJson(res, 409, { error: "name_taken" });
-    const { salt, hash } = auth.hashPassword(password);
-    const user = store.createUser({ name, salt, hash });
+    const { salt, hash } = await auth.hashPassword(password);
+    // createUser does its own (race-safe) duplicate check and returns null instead
+    // of throwing, so this is the only duplicate-name check needed - no separate
+    // pre-check here, which would otherwise leave a window for two concurrent
+    // registrations to both pass a pre-check before either actually reserves the name.
+    const user = await store.createUser({ name, salt, hash });
+    if (!user) return sendJson(res, 409, { error: "name_taken" });
     return sendJson(res, 200, { token: auth.signToken(user.id), name: user.name });
   }
 
@@ -78,9 +80,14 @@ async function handleApi(req, res, url) {
     const password = typeof body.password === "string" ? body.password : "";
     const user = store.getUserByName(name);
     // Always run a verify to keep timing similar whether or not the user exists.
+    // The dummy hash MUST be the same byte length as a real one (auth.DUMMY_HASH_HEX
+    // is 64 bytes hex-encoded) - a shorter dummy makes verifyPassword's length check
+    // short-circuit before timingSafeEqual runs, which would make the nonexistent-user
+    // path measurably faster than the wrong-password path, reintroducing the exact
+    // timing side-channel this dummy call exists to prevent.
     const ok = user
-      ? auth.verifyPassword(password, user.salt, user.hash)
-      : auth.verifyPassword(password, "00000000000000000000000000000000", "00");
+      ? await auth.verifyPassword(password, user.salt, user.hash)
+      : await auth.verifyPassword(password, "dummy-salt", auth.DUMMY_HASH_HEX);
     if (!user || !ok) return sendJson(res, 401, { error: "bad_credentials" });
     return sendJson(res, 200, { token: auth.signToken(user.id), name: user.name });
   }
@@ -88,7 +95,7 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/characters") {
     const userId = authUserId(req);
     if (!userId) return sendJson(res, 401, { error: "unauthorized" });
-    return sendJson(res, 200, { characters: store.listCharacters(userId), name: store.getUserById(userId).name });
+    return sendJson(res, 200, { characters: await store.listCharacters(userId), name: store.getUserById(userId).name });
   }
 
   if (req.method === "POST" && url.pathname === "/api/character") {
@@ -98,16 +105,20 @@ async function handleApi(req, res, url) {
     const slot = Number(body.slot);
     if (!Number.isInteger(slot) || slot < 0 || slot > 9) return sendJson(res, 400, { error: "invalid_slot" });
     if (!body.data || typeof body.data !== "object") return sendJson(res, 400, { error: "invalid_data" });
-    store.saveCharacter(userId, slot, body.data);
+    await store.saveCharacter(userId, slot, body.data);
     return sendJson(res, 200, { ok: true });
   }
 
   if (req.method === "DELETE" && url.pathname === "/api/character") {
     const userId = authUserId(req);
     if (!userId) return sendJson(res, 401, { error: "unauthorized" });
+    // Check the param is actually present BEFORE coercing: Number(null) === 0, so a
+    // missing ?slot= would otherwise silently validate as "delete slot 0" instead of
+    // being rejected as a malformed request.
+    if (!url.searchParams.has("slot")) return sendJson(res, 400, { error: "invalid_slot" });
     const slot = Number(url.searchParams.get("slot"));
     if (!Number.isInteger(slot) || slot < 0 || slot > 9) return sendJson(res, 400, { error: "invalid_slot" });
-    store.deleteCharacter(userId, slot);
+    await store.deleteCharacter(userId, slot);
     return sendJson(res, 200, { ok: true });
   }
 
@@ -129,8 +140,17 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 
-server.listen(port, () => {
-  console.log(`Eryndor Multiplayer Server running on port ${port}`);
+// store.init() is async (it reads users.json off disk) and this file is CommonJS,
+// so there's no top-level await - listening must wait inside a .then() instead of
+// running store.init() fire-and-forget, otherwise a request could arrive and read
+// the in-memory `users` map before the file finished loading into it.
+store.init().then(() => {
+  server.listen(port, () => {
+    console.log(`Eryndor Multiplayer Server running on port ${port}`);
+  });
+}).catch((err) => {
+  console.error("Failed to initialize store:", err);
+  process.exit(1);
 });
 
 const players = new Map();
