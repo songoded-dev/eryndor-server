@@ -10,53 +10,138 @@ const PASSWORD_MIN = 6;
 const PASSWORD_MAX = 200;
 const MAX_BODY_BYTES = 512 * 1024; // a character save with full inventory, comfortably
 
-// ── Phase 2 Slice 1: validation gate over the host relay ──
+// ── Phase 2: validation gate over the host relay ──
 // Enemy AI/combat/loot still runs entirely client-side (the "host" simulates it and
 // broadcasts enemy_sync; player_damage is likewise host-relayed) - porting that whole
 // system (7 classes, gear/talent-dependent damage formulas, dungeon-specific boss
-// mechanics) to the server is a much larger project or a future slice. What this DOES
-// close: a malicious host can no longer broadcast fabricated/god-mode/one-hp-piñata
-// enemies in the open world, or deal arbitrary/negative damage to another player -
-// the two concrete abuses named by the security review. Values outside these generous
-// bounds are dropped rather than relayed; legitimate play is far inside them.
+// mechanics) to the server is a much larger project. What this DOES close: a malicious
+// host can no longer broadcast fabricated/god-mode/one-hp-piñata enemies, or deal
+// arbitrary/negative damage to another player - the two concrete abuses named by the
+// security review. Values outside these generous bounds are dropped rather than
+// relayed; legitimate play is far inside them.
 //
-// Base hp/power for the open-world roster only (mirrors eryndor/game.js enemyTypes for
-// exactly the types spawnInitialEnemies places in "world"). Dungeon/raid/T+ zones use
-// much wider, content-specific multipliers this slice doesn't attempt to characterize,
-// so entries outside "world" are passed through unvalidated, same as before.
-const WORLD_ENEMY_BASE = {
+// Base (unscaled, level-0-offset) hp/power for every enemy type in eryndor/game.js's
+// enemyTypes table - kept minimal (just what the bound formula needs) and deliberately
+// duplicated: growing the roster requires updating both files, an acceptable cost for a
+// real security boundary with no shared build step between client and server.
+const ENEMY_BASE_STATS = {
   riftling: { hp: 72, power: 10 },
   forsworn: { hp: 95, power: 13 },
+  ashfangRaider: { hp: 120, power: 16 },
+  ashfangWarrior: { hp: 155, power: 19 },
+  ashfangJailer: { hp: 145, power: 18 },
+  ashfangElite: { hp: 220, power: 24 },
   sentinel: { hp: 125, power: 16 },
+  harbinger: { hp: 520, power: 24 },
+  hollowBoss: { hp: 430, power: 21 },
+  abyssalBoss: { hp: 880, power: 30 },
+  vorash: { hp: 560, power: 24 },
+  krogath: { hp: 780, power: 29 },
+  drakvorn: { hp: 1180, power: 36 },
+  solmaw: { hp: 950, power: 30 },
+  voidSpawn: { hp: 240, power: 26 },
+  voidStalker: { hp: 320, power: 32 },
+  voidWeaver: { hp: 420, power: 36 },
+  nyxaroth: { hp: 2600, power: 44 },
   corruptedHusk: { hp: 380, power: 30 },
   blightHound: { hp: 260, power: 27 },
-  harbinger: { hp: 520, power: 24 },
   blightheart: { hp: 1400, power: 38 },
-  solmaw: { hp: 950, power: 30 }
+  stoneShell: { hp: 140, power: 17 },
+  earthenWarden: { hp: 210, power: 22 },
+  coralGolem: { hp: 290, power: 26 },
+  frozenSentinel: { hp: 130, power: 16 },
+  depthCrystal: { hp: 175, power: 20 },
+  glacialWraith: { hp: 155, power: 19 },
+  emberstoke: { hp: 145, power: 20 },
+  ventHowler: { hp: 110, power: 18 },
+  scaldingBrute: { hp: 260, power: 27 },
+  arcReaver: { hp: 120, power: 17 },
+  stormDrifter: { hp: 160, power: 21 },
+  conductorWraith: { hp: 195, power: 23 },
+  lithvorn: { hp: 1800, power: 38 },
+  vaelthas: { hp: 1600, power: 34 },
+  ignivex: { hp: 1750, power: 40 },
+  nexal: { hp: 1650, power: 36 },
+  aquerath: { hp: 4800, power: 52 },
+  emberReinforcement: { hp: 280, power: 24 },
+  emberVoidAdd: { hp: 150, power: 22 },
+  emberFireAdd: { hp: 135, power: 21 },
+  emberFirePortal: { hp: 420, power: 0 },
+  tPlusVoidPortalLord: { hp: 520, power: 34 },
+  tPlusMoonknight: { hp: 480, power: 31 },
+  tPlusLunarFragment: { hp: 95, power: 0 },
+  tPlusLightBlob: { hp: 80, power: 0 },
+  tPlusSpectralMimic: { hp: 560, power: 36 },
+  tPlusVoidChampion: { hp: 760, power: 42 },
+  raidBoss: { hp: 980, power: 33 },
+  undervaultDrone: { hp: 110, power: 15 },
+  busterMk1: { hp: 1400, power: 28 },
+  moonknightSeeker: { hp: 800, power: 26 },
+  moonknightWarden: { hp: 900, power: 30 },
+  moonknightShade: { hp: 750, power: 27 },
+  moonknightHigh: { hp: 1100, power: 32 },
+  obliteratorMk10: { hp: 2200, power: 42 },
+  ironSuitVanguard: { hp: 2600, power: 34 },
+  ironSuitVanguard2: { hp: 900, power: 28 },
+  ironSuitSentinel: { hp: 950, power: 26 },
+  ironSuitSentinel2: { hp: 950, power: 26 },
+  ironSuitInterceptor: { hp: 850, power: 30 },
+  ironSuitInterceptor2: { hp: 850, power: 30 },
+  ironSuitSiege: { hp: 1400, power: 38 },
+  ironSuitSiege2: { hp: 1400, power: 38 },
+  ironSuitWarlord: { hp: 1700, power: 44 },
+  ironSuitWarlord2: { hp: 1700, power: 44 },
+  api: { hp: 5500, power: 48 }
 };
 
-// Mirrors the scaling in spawnEnemy/levelUpEnemy for the world zone specifically, where
-// no T+/difficulty multiplier applies (those are dungeon/raid-only): hp = base + level*18,
-// power = base + level*2. A wide [0.3x, 4x] band absorbs any rounding/legacy variance
-// without letting through an order-of-magnitude fabrication (a 1-hp piñata or a
-// invincible/one-shot "enemy").
-function isPlausibleWorldEnemy(enemy) {
-  const base = WORLD_ENEMY_BASE[enemy.type];
-  if (!base) return true; // unknown/non-world type: not this slice's job, pass through
-  const level = Number.isFinite(enemy.level) ? enemy.level : 1;
+// Enemy level tracks nearby player level (spawnEnemy's getMaxPlayerLevelNear), and player
+// level caps at 60 (the same clamp the client's save-load applies) - 100 is a generous
+// headroom above any legitimate value, chosen so a claimed level itself can't be used to
+// smuggle an arbitrary hp/power ceiling through the formula below.
+const MAX_PLAUSIBLE_ENEMY_LEVEL = 100;
+
+// World-zone enemies use the exact formula from spawnEnemy/levelUpEnemy with no T+/
+// difficulty multiplier (those only apply in dungeon:/raid: areas): hp = base + level*18,
+// power = base + level*2. A [0.3x, 4x] band absorbs rounding/legacy variance without
+// letting through an order-of-magnitude fabrication.
+const WORLD_HP_CEILING_MULT = 4;
+const WORLD_POWER_CEILING_MULT = 4;
+
+// Dungeon/raid/T+ zones layer a MUCH wider, content-specific multiplier on top of that
+// same base formula (getTPlusStaticEnemyMultipliers): tier scales up to 1+100*0.15=16x hp
+// / 1+100*0.12=13x power at the max tier (TPLUS_MAX_TIER=100), and at high tier ALL 24
+// affixes in the pool are simultaneously active (getTPlusAffixCount caps at 24, the full
+// pool size) - including both HP-scaling affixes (voidAnnihilation, lightPower, each
+// hp*=3) and all four power-scaling ones (+ moonEclipse *1.5, lightHope *1.35). Worst
+// case: 16 * 3*3 = 144x hp, 13 * 3*3*1.5*1.35 ≈ 237x power. The server has no reliable way
+// to know which tier/affixes a given run actually used (that seed includes the player's
+// local hero name, never sent to the server - see eryndor-server-security-review memory),
+// so rather than guess, this uses the maximum ANY legitimate combination could ever
+// produce as a hard ceiling, with headroom for rounding/future content growth.
+const DUNGEON_HP_CEILING_MULT = 180;
+const DUNGEON_POWER_CEILING_MULT = 300;
+const FLOOR_MULT = 0.3; // same floor as the world zone: catches "1-hp piñata" fabrication
+
+function isPlausibleEnemy(enemy) {
+  const base = ENEMY_BASE_STATS[enemy.type];
+  if (!base) return true; // unknown type: not this check's job, pass through
+  const level = Number.isFinite(enemy.level) ? Math.max(1, Math.min(MAX_PLAUSIBLE_ENEMY_LEVEL, enemy.level)) : 1;
   const expectedHp = base.hp + level * 18;
   const expectedPower = base.power + level * 2;
-  if (!Number.isFinite(enemy.maxHp) || enemy.maxHp < expectedHp * 0.3 || enemy.maxHp > expectedHp * 4) return false;
+  const isWorld = (enemy.area || "world") === "world";
+  const hpCeilingMult = isWorld ? WORLD_HP_CEILING_MULT : DUNGEON_HP_CEILING_MULT;
+  const powerCeilingMult = isWorld ? WORLD_POWER_CEILING_MULT : DUNGEON_POWER_CEILING_MULT;
+  if (!Number.isFinite(enemy.maxHp) || enemy.maxHp < expectedHp * FLOOR_MULT || enemy.maxHp > expectedHp * hpCeilingMult) return false;
   if (!Number.isFinite(enemy.hp) || enemy.hp > enemy.maxHp * 1.05) return false;
-  if (enemy.power != null && (!Number.isFinite(enemy.power) || enemy.power < expectedPower * 0.3 || enemy.power > expectedPower * 4)) return false;
+  if (enemy.power != null && (!Number.isFinite(enemy.power) || enemy.power < expectedPower * FLOOR_MULT || enemy.power > expectedPower * powerCeilingMult)) return false;
   return true;
 }
 
 function sanitizeEnemySync(enemies, onDropped) {
   if (!Array.isArray(enemies)) return [];
   return enemies.filter((enemy) => {
-    if (!enemy || typeof enemy !== "object" || (enemy.area || "world") !== "world") return true;
-    const ok = isPlausibleWorldEnemy(enemy);
+    if (!enemy || typeof enemy !== "object") return true;
+    const ok = isPlausibleEnemy(enemy);
     if (!ok) onDropped(enemy);
     return ok;
   });
