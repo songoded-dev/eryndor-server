@@ -138,7 +138,9 @@ const server = http.createServer((req, res) => {
   res.end("Eryndor multiplayer server");
 });
 
-const wss = new WebSocketServer({ server });
+// maxPayload caps a single WS frame (anti-amplification): the HTTP body limit doesn't
+// apply to WS, and ws otherwise allows ~100MB frames a client could broadcast to everyone.
+const wss = new WebSocketServer({ server, maxPayload: 256 * 1024 });
 
 // store.init() is async (it reads users.json off disk) and this file is CommonJS,
 // so there's no top-level await - listening must wait inside a .then() instead of
@@ -159,12 +161,32 @@ const parties = new Map();
 const pendingInvites = new Map(); // invitedId -> Set<inviterId>: invites we've actually relayed
 let hostId = null;
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
+  // Authenticate the socket from the token in the query string (?token=...). Only a valid
+  // account may join multiplayer; the resolved name is then the ONLY identity trusted for
+  // this connection's messages, so a client can no longer impersonate anyone by asserting
+  // a name/id in the payload.
+  let authName = null;
+  try {
+    const url = new URL(req.url, "http://localhost");
+    const uid = auth.verifyToken(url.searchParams.get("token") || "");
+    const user = uid && store.getUserById(uid);
+    if (user) authName = user.name;
+  } catch { /* fall through to reject */ }
+  if (!authName) {
+    ws.close(4001, "unauthorized");
+    return;
+  }
+
   const playerId = Math.random().toString(36).substring(2, 9);
-  console.log(`Player connected: ${playerId}`);
+  console.log(`Player connected: ${playerId} (${authName})`);
 
   clients.set(playerId, ws);
-  players.set(playerId, { id: playerId, lastUpdate: Date.now() });
+  players.set(playerId, { id: playerId, name: authName, lastUpdate: Date.now() });
+
+  // Per-connection rate limit: drop anything past the cap in a rolling 1s window.
+  let msgCount = 0;
+  let windowStart = Date.now();
 
   if (hostId === null) {
     hostId = playerId;
@@ -174,6 +196,11 @@ wss.on("connection", (ws) => {
   }
 
   ws.on("message", (message) => {
+    // Rate limit before doing any work: ~200 messages/sec/connection is far above normal
+    // play but stops a client from flooding the relay.
+    const now = Date.now();
+    if (now - windowStart >= 1000) { windowStart = now; msgCount = 0; }
+    if (++msgCount > 200) return;
     try {
       const data = JSON.parse(message);
 
@@ -181,6 +208,7 @@ wss.on("connection", (ws) => {
         players.set(playerId, {
           ...data.player,
           id: playerId,
+          name: authName, // force the authenticated name; ignore any client-supplied name
           lastUpdate: Date.now()
         });
 
@@ -231,10 +259,12 @@ wss.on("connection", (ws) => {
           }));
         }
       } else if (data.type === "chat") {
+        const text = typeof data.text === "string" ? data.text.slice(0, 500) : "";
+        if (!text) return;
         const broadcastData = JSON.stringify({
           type: "chat",
-          name: data.name,
-          text: data.text
+          name: authName, // trusted server-bound name, never the client-supplied one
+          text
         });
 
         wss.clients.forEach((client) => {
