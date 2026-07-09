@@ -10,6 +10,67 @@ const PASSWORD_MIN = 6;
 const PASSWORD_MAX = 200;
 const MAX_BODY_BYTES = 512 * 1024; // a character save with full inventory, comfortably
 
+// ── Phase 2 Slice 1: validation gate over the host relay ──
+// Enemy AI/combat/loot still runs entirely client-side (the "host" simulates it and
+// broadcasts enemy_sync; player_damage is likewise host-relayed) - porting that whole
+// system (7 classes, gear/talent-dependent damage formulas, dungeon-specific boss
+// mechanics) to the server is a much larger project or a future slice. What this DOES
+// close: a malicious host can no longer broadcast fabricated/god-mode/one-hp-piñata
+// enemies in the open world, or deal arbitrary/negative damage to another player -
+// the two concrete abuses named by the security review. Values outside these generous
+// bounds are dropped rather than relayed; legitimate play is far inside them.
+//
+// Base hp/power for the open-world roster only (mirrors eryndor/game.js enemyTypes for
+// exactly the types spawnInitialEnemies places in "world"). Dungeon/raid/T+ zones use
+// much wider, content-specific multipliers this slice doesn't attempt to characterize,
+// so entries outside "world" are passed through unvalidated, same as before.
+const WORLD_ENEMY_BASE = {
+  riftling: { hp: 72, power: 10 },
+  forsworn: { hp: 95, power: 13 },
+  sentinel: { hp: 125, power: 16 },
+  corruptedHusk: { hp: 380, power: 30 },
+  blightHound: { hp: 260, power: 27 },
+  harbinger: { hp: 520, power: 24 },
+  blightheart: { hp: 1400, power: 38 },
+  solmaw: { hp: 950, power: 30 }
+};
+
+// Mirrors the scaling in spawnEnemy/levelUpEnemy for the world zone specifically, where
+// no T+/difficulty multiplier applies (those are dungeon/raid-only): hp = base + level*18,
+// power = base + level*2. A wide [0.3x, 4x] band absorbs any rounding/legacy variance
+// without letting through an order-of-magnitude fabrication (a 1-hp piñata or a
+// invincible/one-shot "enemy").
+function isPlausibleWorldEnemy(enemy) {
+  const base = WORLD_ENEMY_BASE[enemy.type];
+  if (!base) return true; // unknown/non-world type: not this slice's job, pass through
+  const level = Number.isFinite(enemy.level) ? enemy.level : 1;
+  const expectedHp = base.hp + level * 18;
+  const expectedPower = base.power + level * 2;
+  if (!Number.isFinite(enemy.maxHp) || enemy.maxHp < expectedHp * 0.3 || enemy.maxHp > expectedHp * 4) return false;
+  if (!Number.isFinite(enemy.hp) || enemy.hp > enemy.maxHp * 1.05) return false;
+  if (enemy.power != null && (!Number.isFinite(enemy.power) || enemy.power < expectedPower * 0.3 || enemy.power > expectedPower * 4)) return false;
+  return true;
+}
+
+function sanitizeEnemySync(enemies, onDropped) {
+  if (!Array.isArray(enemies)) return [];
+  return enemies.filter((enemy) => {
+    if (!enemy || typeof enemy !== "object" || (enemy.area || "world") !== "world") return true;
+    const ok = isPlausibleWorldEnemy(enemy);
+    if (!ok) onDropped(enemy);
+    return ok;
+  });
+}
+
+// A ceiling no legitimate single hit should approach even with high-end gear/crit/talent
+// stacking (per the enemy power scale, world/dungeon content deals tens to low hundreds
+// per hit at max level) - this only catches fabricated/absurd values, not fine-tuned
+// balance, which would need per-class formula data this slice doesn't have.
+const MAX_PLAUSIBLE_HIT = 100000;
+function isPlausibleDamage(amount) {
+  return Number.isFinite(amount) && amount >= 0 && amount <= MAX_PLAUSIBLE_HIT;
+}
+
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(status, {
@@ -223,9 +284,12 @@ wss.on("connection", (ws, req) => {
           }
         });
       } else if (data.type === "enemy_sync" && playerId === hostId) {
+        const enemies = sanitizeEnemySync(data.enemies, (dropped) => {
+          console.warn(`Dropped implausible world enemy from host ${playerId}:`, dropped.type, dropped.hp, dropped.maxHp, dropped.power);
+        });
         const broadcastData = JSON.stringify({
           type: "enemy_sync",
-          enemies: data.enemies
+          enemies
         });
 
         wss.clients.forEach((client) => {
@@ -239,6 +303,10 @@ wss.on("connection", (ws, req) => {
           hostClient.send(JSON.stringify(data));
         }
       } else if (data.type === "player_damage" && playerId === hostId) {
+        if (!isPlausibleDamage(data.damage)) {
+          console.warn(`Dropped implausible player_damage from host ${playerId}:`, data.damage);
+          return;
+        }
         const targetClient = clients.get(data.targetId);
         if (targetClient && targetClient.readyState === 1) {
           targetClient.send(JSON.stringify({
