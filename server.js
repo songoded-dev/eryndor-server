@@ -156,6 +156,7 @@ store.init().then(() => {
 const players = new Map();
 const clients = new Map();
 const parties = new Map();
+const pendingInvites = new Map(); // invitedId -> Set<inviterId>: invites we've actually relayed
 let hostId = null;
 
 wss.on("connection", (ws) => {
@@ -218,6 +219,17 @@ wss.on("connection", (ws) => {
             damage: data.damage
           }));
         }
+      } else if (data.type === "player_heal" && playerId === hostId) {
+        // Mirror of player_damage: only the host may heal a player, relayed to the target.
+        // Previously unhandled, so cross-player healing (healRemotePlayer) silently did nothing.
+        const targetClient = clients.get(data.targetId);
+        if (targetClient && targetClient.readyState === 1) {
+          targetClient.send(JSON.stringify({
+            type: "player_heal",
+            targetId: data.targetId,
+            heal: data.heal
+          }));
+        }
       } else if (data.type === "chat") {
         const broadcastData = JSON.stringify({
           type: "chat",
@@ -242,6 +254,9 @@ wss.on("connection", (ws) => {
         if (targetId) {
           const targetWs = clients.get(targetId);
           if (targetWs && targetWs.readyState === 1) {
+            // Record the invite so a later party_accept can be validated against it.
+            if (!pendingInvites.has(targetId)) pendingInvites.set(targetId, new Set());
+            pendingInvites.get(targetId).add(playerId);
             targetWs.send(JSON.stringify({
               type: "party_invite",
               fromId: playerId,
@@ -251,32 +266,39 @@ wss.on("connection", (ws) => {
         }
       } else if (data.type === "party_accept") {
         const senderId = data.fromId;
-        let party = null;
+        // Only honor an accept that matches an invite we actually relayed to THIS player.
+        // Without this a client could forge membership (or force a victim into a party)
+        // just by sending a spoofed fromId it never received an invite from.
+        const invitesForMe = pendingInvites.get(playerId);
+        if (invitesForMe && invitesForMe.has(senderId)) {
+          invitesForMe.delete(senderId);
+          let party = null;
 
-        for (const p of parties.values()) {
-          if (p.members.includes(senderId)) {
-            party = p;
-            break;
+          for (const p of parties.values()) {
+            if (p.members.includes(senderId)) {
+              party = p;
+              break;
+            }
           }
-        }
 
-        if (!party) {
-          const partyId = Math.random().toString(36).substring(2, 9);
-          party = {
-            id: partyId,
-            members: [senderId, playerId],
-            leader: senderId,
-            isRaid: false
-          };
-          parties.set(partyId, party);
-        } else {
-          const limit = party.isRaid ? 30 : 10;
-          if (party.members.length < limit) {
-            party.members.push(playerId);
+          if (!party) {
+            const partyId = Math.random().toString(36).substring(2, 9);
+            party = {
+              id: partyId,
+              members: [senderId, playerId],
+              leader: senderId,
+              isRaid: false
+            };
+            parties.set(partyId, party);
+          } else {
+            const limit = party.isRaid ? 30 : 10;
+            if (party.members.length < limit && !party.members.includes(playerId)) {
+              party.members.push(playerId);
+            }
           }
-        }
 
-        broadcastPartyUpdate(party);
+          broadcastPartyUpdate(party);
+        }
       } else if (data.type === "party_leave") {
         handlePartyLeave(playerId);
       } else if (data.type === "party_kick") {
@@ -295,6 +317,9 @@ wss.on("connection", (ws) => {
     handlePartyLeave(playerId);
     players.delete(playerId);
     clients.delete(playerId);
+    // Drop any invites to or from this player so they can't be accepted after they leave.
+    pendingInvites.delete(playerId);
+    for (const inviters of pendingInvites.values()) inviters.delete(playerId);
 
     if (playerId === hostId) {
       hostId = null;
@@ -336,6 +361,14 @@ function handlePartyLeave(playerId) {
   if (!party) return;
 
   party.members = party.members.filter(id => id !== playerId);
+
+  // Tell the departing member (voluntary leave OR kick) so their client clears its party
+  // UI. Previously only the remaining members were updated, leaving a kicked/left player's
+  // panel frozen with a party they're no longer in.
+  const leaverWs = clients.get(playerId);
+  if (leaverWs && leaverWs.readyState === 1) {
+    leaverWs.send(JSON.stringify({ type: "party_update", party: null }));
+  }
 
   if (party.members.length < 2) {
     if (party.members.length === 1) {

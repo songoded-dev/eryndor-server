@@ -13,10 +13,17 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { promisify } = require("util");
+
+const scrypt = promisify(crypto.scrypt);
 
 const DATA_DIR = process.env.ERYNDOR_DATA_DIR || path.join(__dirname, "data");
 const SECRET_FILE = path.join(DATA_DIR, "secret.key");
 const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+// verifyPassword's timing-normalization dummy hash must be the same BYTE LENGTH as a
+// real scrypt hash (64 bytes / 128 hex chars), or the length check short-circuits
+// before timingSafeEqual ever runs, defeating the whole point of the dummy call.
+const DUMMY_HASH_HEX = "00".repeat(64);
 
 // The signing secret comes from the environment in production; locally we persist
 // a generated one so tokens stay valid across restarts during development.
@@ -35,18 +42,28 @@ function getSecret() {
   }
   secret = crypto.randomBytes(32);
   fs.mkdirSync(path.dirname(SECRET_FILE), { recursive: true });
-  fs.writeFileSync(SECRET_FILE, secret.toString("hex"));
+  // Temp-file-then-rename, same atomic pattern store.js uses: two processes racing
+  // on a fresh boot (no ERYNDOR_SECRET, no secret.key yet) must not leave a
+  // half-written or "last writer wins but callers already cached a different value"
+  // secret.key on disk.
+  const tmp = `${SECRET_FILE}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmp, secret.toString("hex"));
+  fs.renameSync(tmp, SECRET_FILE);
   return secret;
 }
 
-function hashPassword(password) {
+// scrypt is CPU-bound and synchronous scrypt would block Node's single event loop
+// for the full ~50-100ms hash duration - on this server that loop also runs the
+// WebSocket relay, so a blocking hash would freeze every connected player's game
+// during any other player's login/register. The async form yields the loop instead.
+async function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString("hex");
-  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  const hash = (await scrypt(password, salt, 64)).toString("hex");
   return { salt, hash };
 }
 
-function verifyPassword(password, salt, expectedHash) {
-  const hash = crypto.scryptSync(password, salt, 64);
+async function verifyPassword(password, salt, expectedHash) {
+  const hash = await scrypt(password, salt, 64);
   const expected = Buffer.from(expectedHash, "hex");
   return hash.length === expected.length && crypto.timingSafeEqual(hash, expected);
 }
@@ -76,4 +93,4 @@ function verifyToken(token) {
   return userId;
 }
 
-module.exports = { hashPassword, verifyPassword, signToken, verifyToken };
+module.exports = { hashPassword, verifyPassword, signToken, verifyToken, DUMMY_HASH_HEX };
