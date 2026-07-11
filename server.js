@@ -426,26 +426,36 @@ wss.on("connection", (ws, req) => {
           }
         });
       } else if (data.type === "party_invite") {
+        // Case-insensitive: players.get(id).name is the authenticated account name (Phase
+        // 1 forces it), and a friend typing it from memory shouldn't have to match casing
+        // exactly. This also works for ANY connected player, not just ones the inviter has
+        // seen on their canvas - the "click a player" UI restriction was purely client-side.
+        const targetName = typeof data.targetName === "string" ? data.targetName.trim().toLowerCase() : "";
         let targetId = null;
-        for (const [id, p] of players.entries()) {
-          if (p.name === data.targetName && id !== playerId) {
-            targetId = id;
-            break;
+        if (targetName) {
+          for (const [id, p] of players.entries()) {
+            if (id !== playerId && typeof p.name === "string" && p.name.toLowerCase() === targetName) {
+              targetId = id;
+              break;
+            }
           }
         }
 
-        if (targetId) {
-          const targetWs = clients.get(targetId);
-          if (targetWs && targetWs.readyState === 1) {
-            // Record the invite so a later party_accept can be validated against it.
-            if (!pendingInvites.has(targetId)) pendingInvites.set(targetId, new Set());
-            pendingInvites.get(targetId).add(playerId);
-            targetWs.send(JSON.stringify({
-              type: "party_invite",
-              fromId: playerId,
-              fromName: players.get(playerId).name
-            }));
-          }
+        const targetWs = targetId && clients.get(targetId);
+        if (targetWs && targetWs.readyState === 1) {
+          // Record the invite so a later party_accept can be validated against it.
+          if (!pendingInvites.has(targetId)) pendingInvites.set(targetId, new Set());
+          pendingInvites.get(targetId).add(playerId);
+          targetWs.send(JSON.stringify({
+            type: "party_invite",
+            fromId: playerId,
+            fromName: players.get(playerId).name
+          }));
+          ws.send(JSON.stringify({ type: "party_invite_sent", targetName: players.get(targetId).name }));
+        } else {
+          // Silent failure is a real problem for a type-a-name invite flow: the sender has
+          // no way to tell "not online" from "worked, just waiting." Report it back.
+          ws.send(JSON.stringify({ type: "party_invite_failed", targetName: data.targetName }));
         }
       } else if (data.type === "party_accept") {
         const senderId = data.fromId;
