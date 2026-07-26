@@ -156,6 +156,17 @@ function isPlausibleDamage(amount) {
   return Number.isFinite(amount) && amount >= 0 && amount <= MAX_PLAUSIBLE_HIT;
 }
 
+// apply_buff lets any client apply a specific, allowlisted buff to another specific
+// player (e.g. Druid's Nature Protection cast on an ally, Knight's Divine Substitution) -
+// unlike player_damage/player_heal this isn't host-gated, since it's a caster-to-target
+// buff application rather than combat resolution. The allowlist plus a bounded duration
+// keeps a compromised/modified client from applying an arbitrary effect for an arbitrary
+// length of time.
+const ALLOWED_BUFF_TYPES = new Set(["nature_protection", "divine_substitution"]);
+function isPlausibleBuff(data) {
+  return ALLOWED_BUFF_TYPES.has(data.buff) && Number.isFinite(data.duration) && data.duration >= 0 && data.duration <= 60;
+}
+
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(status, {
@@ -305,6 +316,8 @@ const players = new Map();
 const clients = new Map();
 const parties = new Map();
 const pendingInvites = new Map(); // invitedId -> Set<inviterId>: invites we've actually relayed
+const duels = new Map(); // duelId -> {id, a, b}: active 1v1 duels
+const pendingDuelInvites = new Map(); // invitedId -> Set<inviterId>: duel challenges we've actually relayed
 let hostId = null;
 
 wss.on("connection", (ws, req) => {
@@ -411,6 +424,34 @@ wss.on("connection", (ws, req) => {
             heal: data.heal
           }));
         }
+      } else if (data.type === "apply_buff") {
+        if (!isPlausibleBuff(data)) {
+          console.warn(`Dropped implausible apply_buff from ${playerId}:`, data.buff, data.duration);
+          return;
+        }
+        const targetClient = clients.get(data.targetId);
+        if (targetClient && targetClient.readyState === 1) {
+          targetClient.send(JSON.stringify({
+            type: "apply_buff",
+            targetId: data.targetId,
+            buff: data.buff,
+            duration: data.duration,
+            casterId: playerId,
+            casterName: players.get(playerId)?.name || null
+          }));
+        }
+      } else if (data.type === "redirect_damage" && isPlausibleDamage(data.damage)) {
+        // Knight's Divine Substitution: the ally being substituted for sends this instead
+        // of taking the damage themselves. Not host-gated - the sender is redirecting their
+        // OWN incoming hit, not asserting authority over someone else's combat outcome.
+        const targetClient = clients.get(data.targetId);
+        if (targetClient && targetClient.readyState === 1) {
+          targetClient.send(JSON.stringify({
+            type: "redirect_damage",
+            targetId: data.targetId,
+            damage: data.damage
+          }));
+        }
       } else if (data.type === "chat") {
         const text = typeof data.text === "string" ? data.text.slice(0, 500) : "";
         if (!text) return;
@@ -499,6 +540,75 @@ wss.on("connection", (ws, req) => {
         if (party && party.leader === playerId) {
           handlePartyLeave(data.targetId);
         }
+      } else if (data.type === "duel_challenge") {
+        // Mirrors party_invite exactly - same case-insensitive global name lookup, same
+        // pending-ledger anti-spoof pattern, same sent/failed feedback.
+        const targetName = typeof data.targetName === "string" ? data.targetName.trim().toLowerCase() : "";
+        let targetId = null;
+        if (targetName) {
+          for (const [id, p] of players.entries()) {
+            if (id !== playerId && typeof p.name === "string" && p.name.toLowerCase() === targetName) {
+              targetId = id;
+              break;
+            }
+          }
+        }
+
+        const targetWs = targetId && clients.get(targetId);
+        if (targetWs && targetWs.readyState === 1 && !getPlayerDuel(playerId) && !getPlayerDuel(targetId)) {
+          if (!pendingDuelInvites.has(targetId)) pendingDuelInvites.set(targetId, new Set());
+          pendingDuelInvites.get(targetId).add(playerId);
+          targetWs.send(JSON.stringify({
+            type: "duel_challenge",
+            fromId: playerId,
+            fromName: players.get(playerId).name
+          }));
+          ws.send(JSON.stringify({ type: "duel_challenge_sent", targetName: players.get(targetId).name }));
+        } else {
+          ws.send(JSON.stringify({ type: "duel_challenge_failed", targetName: data.targetName }));
+        }
+      } else if (data.type === "duel_accept") {
+        const senderId = data.fromId;
+        const invitesForMe = pendingDuelInvites.get(playerId);
+        if (invitesForMe && invitesForMe.has(senderId) && !getPlayerDuel(playerId) && !getPlayerDuel(senderId)) {
+          invitesForMe.delete(senderId);
+          const duelId = Math.random().toString(36).substring(2, 9);
+          const duel = { id: duelId, a: senderId, b: playerId };
+          duels.set(duelId, duel);
+
+          const startData = (opponentId, opponentName) => JSON.stringify({
+            type: "duel_start", duelId, opponentId, opponentName: players.get(opponentId)?.name || "?"
+          });
+          const senderWs = clients.get(senderId);
+          if (senderWs && senderWs.readyState === 1) senderWs.send(startData(playerId, players.get(playerId).name));
+          ws.send(startData(senderId, players.get(senderId).name));
+        }
+      } else if (data.type === "duel_decline") {
+        const senderId = data.fromId;
+        const invitesForMe = pendingDuelInvites.get(playerId);
+        if (invitesForMe) invitesForMe.delete(senderId);
+      } else if (data.type === "duel_damage" && isPlausibleDamage(data.damage)) {
+        // Not host-gated - this is a self-reported outgoing hit, same trust model as
+        // redirect_damage. What guards against abuse is the active-duel-pair check below:
+        // a message can only land if the server itself recorded these two as duelling.
+        const duel = getPlayerDuel(playerId);
+        const targetId = data.targetId;
+        if (duel && (duel.a === targetId || duel.b === targetId)) {
+          const targetClient = clients.get(targetId);
+          if (targetClient && targetClient.readyState === 1) {
+            targetClient.send(JSON.stringify({ type: "duel_damage", damage: data.damage }));
+          }
+        }
+      } else if (data.type === "duel_end") {
+        const duel = getPlayerDuel(playerId);
+        if (duel) {
+          const opponentId = duel.a === playerId ? duel.b : duel.a;
+          const opponentWs = clients.get(opponentId);
+          if (opponentWs && opponentWs.readyState === 1) {
+            opponentWs.send(JSON.stringify({ type: "duel_end", result: data.result === "forfeit" ? "opponent_forfeited" : "won" }));
+          }
+          duels.delete(duel.id);
+        }
       }
     } catch (e) {
       console.error("Failed to parse message", e);
@@ -513,6 +623,20 @@ wss.on("connection", (ws, req) => {
     // Drop any invites to or from this player so they can't be accepted after they leave.
     pendingInvites.delete(playerId);
     for (const inviters of pendingInvites.values()) inviters.delete(playerId);
+    pendingDuelInvites.delete(playerId);
+    for (const inviters of pendingDuelInvites.values()) inviters.delete(playerId);
+
+    // A disconnect mid-duel is a forfeit - the opponent is declared the winner rather than
+    // being left stuck with a duel that can never end.
+    const activeDuel = getPlayerDuel(playerId);
+    if (activeDuel) {
+      const opponentId = activeDuel.a === playerId ? activeDuel.b : activeDuel.a;
+      const opponentWs = clients.get(opponentId);
+      if (opponentWs && opponentWs.readyState === 1) {
+        opponentWs.send(JSON.stringify({ type: "duel_end", result: "opponent_disconnected" }));
+      }
+      duels.delete(activeDuel.id);
+    }
 
     if (playerId === hostId) {
       hostId = null;
@@ -545,6 +669,13 @@ wss.on("connection", (ws, req) => {
 function getPlayerParty(playerId) {
   for (const party of parties.values()) {
     if (party.members.includes(playerId)) return party;
+  }
+  return null;
+}
+
+function getPlayerDuel(playerId) {
+  for (const duel of duels.values()) {
+    if (duel.a === playerId || duel.b === playerId) return duel;
   }
   return null;
 }
