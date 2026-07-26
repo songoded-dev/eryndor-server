@@ -320,6 +320,15 @@ const duels = new Map(); // duelId -> {id, a, b}: active 1v1 duels
 const pendingDuelInvites = new Map(); // invitedId -> Set<inviterId>: duel challenges we've actually relayed
 let hostId = null;
 
+// ── Dungeon Finder matchmaking ──
+// Server has no access to the client's contentDefs, so the queueable ids are duplicated
+// here - same tradeoff already accepted for ENEMY_BASE_STATS above.
+const ONLINE_QUEUEABLE_IDS = new Set(["dungeon", "emberGates", "abyssalConvergence", "veiledExpanse", "voidPortal", "raid", "undervault"]);
+const TPLUS_QUEUEABLE_IDS = new Set(["dungeonTPlus", "emberGatesTPlus", "abyssalConvergenceTPlus", "veiledExpanseTPlus", "raidTPlus", "undervaultTPlus"]);
+const ROLES = new Set(["tank", "dps", "heal"]);
+const dungeonQueues = new Map(); // queueKey -> { tank: [playerId], dps: [playerId], heal: [playerId] }
+const queuedPlayers = new Map(); // playerId -> { queueKey, role, contentId, tier }
+
 wss.on("connection", (ws, req) => {
   // Authenticate the socket from the token in the query string (?token=...). Only a valid
   // account may join multiplayer; the resolved name is then the ONLY identity trusted for
@@ -516,14 +525,7 @@ wss.on("connection", (ws, req) => {
           }
 
           if (!party) {
-            const partyId = Math.random().toString(36).substring(2, 9);
-            party = {
-              id: partyId,
-              members: [senderId, playerId],
-              leader: senderId,
-              isRaid: false
-            };
-            parties.set(partyId, party);
+            party = createParty([senderId, playerId], senderId);
           } else {
             const limit = party.isRaid ? 30 : 10;
             if (party.members.length < limit && !party.members.includes(playerId)) {
@@ -609,6 +611,30 @@ wss.on("connection", (ws, req) => {
           }
           duels.delete(duel.id);
         }
+      } else if (data.type === "queue_join") {
+        const contentId = data.contentId;
+        const role = data.role;
+        const isTPlus = TPLUS_QUEUEABLE_IDS.has(contentId);
+        const isOnline = ONLINE_QUEUEABLE_IDS.has(contentId);
+        const tier = isTPlus ? Math.min(100, Math.max(1, Math.floor(Number(data.tier)) || 1)) : null;
+
+        if (!ROLES.has(role) || (!isTPlus && !isOnline)) {
+          ws.send(JSON.stringify({ type: "queue_join_failed", reason: "invalid" }));
+        } else if (queuedPlayers.has(playerId)) {
+          ws.send(JSON.stringify({ type: "queue_join_failed", reason: "already_queued" }));
+        } else if (getPlayerParty(playerId)) {
+          ws.send(JSON.stringify({ type: "queue_join_failed", reason: "in_party" }));
+        } else {
+          const queueKey = queueKeyFor(contentId, tier);
+          if (!dungeonQueues.has(queueKey)) dungeonQueues.set(queueKey, { tank: [], dps: [], heal: [] });
+          dungeonQueues.get(queueKey)[role].push(playerId);
+          queuedPlayers.set(playerId, { queueKey, role, contentId, tier });
+          ws.send(JSON.stringify({ type: "queue_joined", contentId, role, tier }));
+          tryFormMatch(queueKey, contentId, tier);
+        }
+      } else if (data.type === "queue_leave") {
+        removeFromQueue(playerId);
+        ws.send(JSON.stringify({ type: "queue_left" }));
       }
     } catch (e) {
       console.error("Failed to parse message", e);
@@ -637,6 +663,8 @@ wss.on("connection", (ws, req) => {
       }
       duels.delete(activeDuel.id);
     }
+
+    removeFromQueue(playerId);
 
     if (playerId === hostId) {
       hostId = null;
@@ -678,6 +706,59 @@ function getPlayerDuel(playerId) {
     if (duel.a === playerId || duel.b === playerId) return duel;
   }
   return null;
+}
+
+function createParty(memberIds, leaderId = memberIds[0]) {
+  const partyId = Math.random().toString(36).substring(2, 9);
+  const party = { id: partyId, members: [...memberIds], leader: leaderId, isRaid: false };
+  parties.set(partyId, party);
+  return party;
+}
+
+function queueKeyFor(contentId, tier) {
+  return tier != null ? `${contentId}:T${tier}` : contentId;
+}
+
+function removeFromQueue(playerId) {
+  const entry = queuedPlayers.get(playerId);
+  if (!entry) return;
+  const bucket = dungeonQueues.get(entry.queueKey);
+  if (bucket) {
+    const arr = bucket[entry.role];
+    const idx = arr.indexOf(playerId);
+    if (idx !== -1) arr.splice(idx, 1);
+    if (bucket.tank.length === 0 && bucket.dps.length === 0 && bucket.heal.length === 0) {
+      dungeonQueues.delete(entry.queueKey);
+    }
+  }
+  queuedPlayers.delete(playerId);
+}
+
+// Forms as many complete 1 tank / 4 dps / 1 heal groups as the bucket currently supports.
+// Tank is shifted first so it becomes the party leader for free.
+function tryFormMatch(queueKey, contentId, tier) {
+  const bucket = dungeonQueues.get(queueKey);
+  if (!bucket) return;
+  while (bucket.tank.length >= 1 && bucket.dps.length >= 4 && bucket.heal.length >= 1) {
+    const tankId = bucket.tank.shift();
+    const dpsIds = bucket.dps.splice(0, 4);
+    const healId = bucket.heal.shift();
+    const roleById = new Map([[tankId, "tank"], [healId, "heal"], ...dpsIds.map((id) => [id, "dps"])]);
+    const memberIds = [tankId, ...dpsIds, healId];
+    for (const id of memberIds) queuedPlayers.delete(id);
+
+    const party = createParty(memberIds, tankId);
+    broadcastPartyUpdate(party);
+    for (const id of memberIds) {
+      const memberWs = clients.get(id);
+      if (memberWs && memberWs.readyState === 1) {
+        memberWs.send(JSON.stringify({ type: "dungeon_queue_matched", contentId, tier, role: roleById.get(id), partyId: party.id }));
+      }
+    }
+  }
+  if (bucket.tank.length === 0 && bucket.dps.length === 0 && bucket.heal.length === 0) {
+    dungeonQueues.delete(queueKey);
+  }
 }
 
 function handlePartyLeave(playerId) {
